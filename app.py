@@ -1,26 +1,31 @@
 import os
 import requests
 import psycopg2
+from psycopg2.extras import Json # Required to save dictionaries to JSONB
 from flask import Flask, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-# CORS allows your frontend (e.g., Vercel) to fetch data from this Render server
+# Allows your React app (Vite/Vercel) to call these APIs
 CORS(app)
 
 def get_db_connection():
-    """Helper function to connect to Aiven PostgreSQL."""
+    """Establishes connection to Aiven PostgreSQL."""
     return psycopg2.connect(os.environ.get('DATABASE_URL'))
 
 def init_db():
-    """Creates the table if it doesn't exist (bypasses Aiven UI errors)."""
+    """
+    Sets up the JSONB table. 
+    NOTE: If you want to wipe old data and start fresh with the new 
+    structure, uncomment the 'DROP TABLE' line for ONE deploy only.
+    """
     conn = get_db_connection()
     cur = conn.cursor()
+    # cur.execute("DROP TABLE IF EXISTS fx_history CASCADE;") 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS fx_history (
             id SERIAL PRIMARY KEY,
-            currency TEXT NOT NULL,
-            rate FLOAT NOT NULL,
+            rates JSONB NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -30,57 +35,59 @@ def init_db():
 
 @app.route('/')
 def home():
-    return "FX Sentinel Server is running. Use /check-rates to update or /api/history/all to fetch data."
+    return "CURRENCY.IO Backend is Live. Endpoints: /check-rates, /api/history/previous, /api/history/all"
 
 @app.route('/check-rates')
 def check_rates():
-    """Triggered by Cron-job.org every hour."""
-    init_db() # Ensure table exists
-    
-    # 1. Fetch current rate (using a reliable free API)
+    """Triggered by Cron-job.org every hour to save global market state."""
+    init_db()
     api_url = "https://open.er-api.com/v6/latest/USD"
+    
     try:
-        data = requests.get(api_url).json()
-        current_rate = data['rates']['EUR']
+        response = requests.get(api_url)
+        data = response.json()
+        all_rates = data['rates'] # Captures all 100+ currencies
     except Exception as e:
-        return f"API Error: {str(e)}", 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
     conn = get_db_connection()
     cur = conn.cursor()
-
-    # 2. Get the most recent saved rate for cross-checking
-    cur.execute("SELECT rate FROM fx_history ORDER BY timestamp DESC LIMIT 1;")
-    row = cur.fetchone()
-    last_rate = row[0] if row else current_rate
-
-    # 3. Save the new rate to the database
-    cur.execute("INSERT INTO fx_history (currency, rate) VALUES (%s, %s)", ('EUR', current_rate))
+    # Save the entire rates dictionary into one JSONB cell
+    cur.execute("INSERT INTO fx_history (rates) VALUES (%s)", [Json(all_rates)])
     conn.commit()
+    cur.close()
+    conn.close()
+    
+    return jsonify({"status": "success", "count": len(all_rates)})
+
+@app.route('/api/history/previous')
+def get_previous_rates():
+    """Returns the rates from the check BEFORE the most recent one for trend comparison."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # OFFSET 1 skips the latest entry to give you the previous historical baseline
+    cur.execute("SELECT rates FROM fx_history ORDER BY timestamp DESC LIMIT 1 OFFSET 1;")
+    row = cur.fetchone()
     
     cur.close()
     conn.close()
-
-    return jsonify({
-        "status": "success",
-        "current_rate": current_rate,
-        "previous_rate": last_rate,
-        "difference": current_rate - last_rate
-    })
+    
+    if row:
+        return jsonify(row[0])
+    return jsonify({}) # Returns empty if database only has 1 entry
 
 @app.route('/api/history/all')
 def get_all_history():
-    """Returns every single rate in the database for your website's chart."""
+    """Returns the full timeline of all saved rates for charts."""
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # Select all data ordered chronologically
-    cur.execute("SELECT rate, timestamp FROM fx_history ORDER BY timestamp ASC;")
+    cur.execute("SELECT rates, timestamp FROM fx_history ORDER BY timestamp ASC;")
     rows = cur.fetchall()
     
-    # Format for Frontend (JSON)
     history = [
         {
-            "rate": row[0], 
+            "rates": row[0], 
             "time": row[1].strftime('%H:%M'),
             "date": row[1].strftime('%Y-%m-%d')
         } for row in rows
@@ -91,5 +98,5 @@ def get_all_history():
     return jsonify(history)
 
 if __name__ == "__main__":
-    # Render requires port 10000
+    # Render's default port is 10000
     app.run(host='0.0.0.0', port=10000)
