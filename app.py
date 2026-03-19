@@ -21,7 +21,7 @@ def init_db():
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    # cur.execute("DROP TABLE IF EXISTS fx_history CASCADE;") 
+    cur.execute("DROP TABLE IF EXISTS fx_history CASCADE;") 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS fx_history (
             id SERIAL PRIMARY KEY,
